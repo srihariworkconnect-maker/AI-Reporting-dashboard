@@ -1,0 +1,28 @@
+import { StrictMode } from 'react';
+import { createRoot } from 'react-dom/client';
+import './index.css';
+import App from './App';
+import { initializeAdoExtension } from './adoExtension';
+
+async function start() {
+    const root = createRoot(document.getElementById('root')!);
+
+    if (window.self !== window.top) {
+        const initialized = await initializeAdoExtension();
+
+        if (!initialized) {
+            root.render(
+                <p>Unable to initialize the Azure DevOps dashboard widget.</p>
+            );
+            return;
+        }
+    }
+
+    root.render(
+        <StrictMode>
+            <App />
+        </StrictMode>
+    );
+}
+
+void start();
