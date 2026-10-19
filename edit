@@ -1,152 +1,134 @@
-import type { AdoTestSuite } from '../types/ado';
-import type { AdoTestPoint } from './adoApi';
-import { getTestPoints } from './adoApi';
+    const [release, setRelease] = useState(819259);
 
-export interface QaMetrics {
-    total: number;
-    passed: number;
-    failed: number;
-    blocked: number;
-    pending: number;
-    notApplicable: number;
-    inProgress: number;
-    otherCompleted: number;
-    unknown: number;
-    executed: number;
-    executionRate: number;
-    passRate: number;
-}
-
-export function getAllSuiteIds(
-    suites: AdoTestSuite[]
-): number[] {
-    const ids = new Set<number>();
-
-    function visit(suite: AdoTestSuite) {
-        if (ids.has(suite.id)) return;
-
-        ids.add(suite.id);
-
-        for (const child of suite.children ?? []) {
-            visit(child);
-        }
-    }
-
-    suites.forEach(visit);
-    return [...ids];
-}
-
-export async function loadPlanMetrics(
-    planId: number,
-    suites: AdoTestSuite[],
-    signal?: AbortSignal
-): Promise<QaMetrics> {
-    const suiteIds = getAllSuiteIds(suites);
-    const allPoints: AdoTestPoint[] = [];
-    const batchSize = 5;
-
-    for (let index = 0; index < suiteIds.length; index += batchSize) {
-        signal?.throwIfAborted();
-
-        const batch = suiteIds.slice(index, index + batchSize);
-
-        const results = await Promise.all(
-            batch.map(suiteId =>
-                getTestPoints(planId, suiteId, signal)
-            )
-        );
-
-        for (const points of results) {
-            allPoints.push(...points);
-        }
-    }
-
-    return calculateQaMetrics(allPoints);
-}
-
-export function calculateQaMetrics(
-    points: AdoTestPoint[]
-): QaMetrics {
-    const uniquePoints = new Map(
-        points.map(point => [point.id, point])
+    const [testPlans, setTestPlans] = useState<AdoTestPlan[]>(
+        isAdoExtension
+            ? []
+            : demoReleases.map(({ id, name }) => ({ id, name }))
     );
 
-    const metrics: QaMetrics = {
-        total: uniquePoints.size,
-        passed: 0,
-        failed: 0,
-        blocked: 0,
-        pending: 0,
-        notApplicable: 0,
-        inProgress: 0,
-        otherCompleted: 0,
-        unknown: 0,
-        executed: 0,
-        executionRate: 0,
-        passRate: 0,
-    };
+    const [suiteTree, setSuiteTree] = useState<AdoTestSuite[]>(
+        isAdoExtension ? [] : getDemoRelease(819259).suites
+    );
 
-    for (const point of uniquePoints.values()) {
-        const outcome = point.results?.outcome?.toLowerCase();
+    const [liveMetrics, setLiveMetrics] =
+        useState<QaMetrics | null>(null);
 
-        switch (outcome) {
-            case 'passed':
-                metrics.passed++;
-                break;
+    const [isLoadingSuites, setIsLoadingSuites] = useState(false);
+    const [error, setError] = useState<string | null>(null);
+    const [loadedAt, setLoadedAt] = useState<string | null>(null);
 
-            case 'failed':
-                metrics.failed++;
-                break;
+    useEffect(() => {
+        if (!isAdoExtension) return;
 
-            case 'blocked':
-                metrics.blocked++;
-                break;
+        const controller = new AbortController();
+        const { signal } = controller;
 
-            case 'notapplicable':
-                metrics.notApplicable++;
-                break;
+        async function loadPlans() {
+            try {
+                const plans = await getTestPlans(signal);
 
-            case 'inprogress':
-            case 'paused':
-                metrics.inProgress++;
-                break;
+                if (signal.aborted) return;
 
-            case 'none':
-            case 'notexecuted':
-                metrics.pending++;
-                break;
+                setTestPlans(plans);
 
-            case 'inconclusive':
-            case 'timeout':
-            case 'aborted':
-            case 'error':
-                metrics.otherCompleted++;
-                break;
+                setRelease(current =>
+                    plans.some(plan => plan.id === current)
+                        ? current
+                        : plans[0]?.id ?? 0
+                );
+            } catch (cause) {
+                if (signal.aborted) return;
 
-            default:
-                metrics.unknown++;
-                break;
+                setError(
+                    cause instanceof Error
+                        ? cause.message
+                        : 'Unable to load test plans.'
+                );
+            }
         }
+
+        void loadPlans();
+
+        return () => controller.abort();
+    }, [isAdoExtension]);
+
+    useEffect(() => {
+        if (!isAdoExtension) return;
+        if (!testPlans.some(plan => plan.id === release)) return;
+
+        const controller = new AbortController();
+        const { signal } = controller;
+
+        setLiveMetrics(null);
+        setSuiteTree([]);
+        setLoadedAt(null);
+        setError(null);
+        setIsLoadingSuites(true);
+
+        async function loadSelectedPlan() {
+            try {
+                const suites = await getTestSuites(release, signal);
+
+                const metrics = await loadPlanMetrics(
+                    release,
+                    suites.value,
+                    signal
+                );
+
+                if (signal.aborted) return;
+
+                setSuiteTree(suites.value);
+                setLiveMetrics(metrics);
+                setLoadedAt(new Date().toLocaleString());
+            } catch (cause) {
+                if (signal.aborted) return;
+
+                setError(
+                    cause instanceof Error
+                        ? cause.message
+                        : 'Unable to load plan analytics.'
+                );
+            } finally {
+                if (!signal.aborted) {
+                    setIsLoadingSuites(false);
+                }
+            }
+        }
+
+        void loadSelectedPlan();
+
+        return () => controller.abort();
+    }, [release, testPlans, isAdoExtension]);
+
+    const selectedPlanName = testPlans.find(
+        plan => plan.id === release
+    )?.name ?? 'Selected test plan';
+
+    const suiteDataSource = isAdoExtension
+        ? loadedAt
+            ? `Retrieved ${loadedAt}`
+            : 'Azure DevOps'
+        : 'Demo hierarchy';
+
+    // Never substitute demo figures for a failed live request.
+    const displayStatus = isAdoExtension
+        ? liveMetrics
+        : getDemoMetrics(release);
+
+    if (!displayStatus) {
+        return (
+            <main className="main">
+                <h1>QA Command Center</h1>
+                <p role={error ? 'alert' : 'status'}>
+                    {error ??
+                        (testPlans.length === 0
+                            ? 'Loading test plans, or no plans are available.'
+                            : 'Loading selected plan analytics...')}
+                </p>
+            </main>
+        );
     }
 
-    // Policy: blocked and N/A do not count as executed.
-    // Other completed outcomes represent completed attempts.
-    metrics.executed =
-        metrics.passed +
-        metrics.failed +
-        metrics.otherCompleted;
-
-    // Policy: N/A points are excluded from the progress denominator.
-    const applicablePoints =
-        metrics.total - metrics.notApplicable;
-
-    metrics.executionRate = applicablePoints > 0
-        ? (metrics.executed / applicablePoints) * 100
-        : 0;
-
-    metrics.passRate = metrics.executed > 0
-        ? (metrics.passed / metrics.executed) * 100
-        : 0;
-
-    return metrics;
-}
+    const executed = displayStatus.executed;
+    const executionRate = displayStatus.executionRate;
+    const passRate = displayStatus.passRate;
