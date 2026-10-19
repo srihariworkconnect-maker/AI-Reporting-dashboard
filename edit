@@ -1,0 +1,134 @@
+    const [release, setRelease] = useState(819259);
+
+    const [testPlans, setTestPlans] = useState<AdoTestPlan[]>(
+        isAdoExtension
+            ? []
+            : demoReleases.map(({ id, name }) => ({ id, name }))
+    );
+
+    const [suiteTree, setSuiteTree] = useState<AdoTestSuite[]>(
+        isAdoExtension ? [] : getDemoRelease(819259).suites
+    );
+
+    const [liveMetrics, setLiveMetrics] =
+        useState<QaMetrics | null>(null);
+
+    const [isLoadingSuites, setIsLoadingSuites] = useState(false);
+    const [error, setError] = useState<string | null>(null);
+    const [loadedAt, setLoadedAt] = useState<string | null>(null);
+
+    useEffect(() => {
+        if (!isAdoExtension) return;
+
+        const controller = new AbortController();
+        const { signal } = controller;
+
+        async function loadPlans() {
+            try {
+                const plans = await getTestPlans(signal);
+
+                if (signal.aborted) return;
+
+                setTestPlans(plans);
+
+                setRelease(current =>
+                    plans.some(plan => plan.id === current)
+                        ? current
+                        : plans[0]?.id ?? 0
+                );
+            } catch (cause) {
+                if (signal.aborted) return;
+
+                setError(
+                    cause instanceof Error
+                        ? cause.message
+                        : 'Unable to load test plans.'
+                );
+            }
+        }
+
+        void loadPlans();
+
+        return () => controller.abort();
+    }, [isAdoExtension]);
+
+    useEffect(() => {
+        if (!isAdoExtension) return;
+        if (!testPlans.some(plan => plan.id === release)) return;
+
+        const controller = new AbortController();
+        const { signal } = controller;
+
+        setLiveMetrics(null);
+        setSuiteTree([]);
+        setLoadedAt(null);
+        setError(null);
+        setIsLoadingSuites(true);
+
+        async function loadSelectedPlan() {
+            try {
+                const suites = await getTestSuites(release, signal);
+
+                const metrics = await loadPlanMetrics(
+                    release,
+                    suites.value,
+                    signal
+                );
+
+                if (signal.aborted) return;
+
+                setSuiteTree(suites.value);
+                setLiveMetrics(metrics);
+                setLoadedAt(new Date().toLocaleString());
+            } catch (cause) {
+                if (signal.aborted) return;
+
+                setError(
+                    cause instanceof Error
+                        ? cause.message
+                        : 'Unable to load plan analytics.'
+                );
+            } finally {
+                if (!signal.aborted) {
+                    setIsLoadingSuites(false);
+                }
+            }
+        }
+
+        void loadSelectedPlan();
+
+        return () => controller.abort();
+    }, [release, testPlans, isAdoExtension]);
+
+    const selectedPlanName = testPlans.find(
+        plan => plan.id === release
+    )?.name ?? 'Selected test plan';
+
+    const suiteDataSource = isAdoExtension
+        ? loadedAt
+            ? `Retrieved ${loadedAt}`
+            : 'Azure DevOps'
+        : 'Demo hierarchy';
+
+    // Never substitute demo figures for a failed live request.
+    const displayStatus = isAdoExtension
+        ? liveMetrics
+        : getDemoMetrics(release);
+
+    if (!displayStatus) {
+        return (
+            <main className="main">
+                <h1>QA Command Center</h1>
+                <p role={error ? 'alert' : 'status'}>
+                    {error ??
+                        (testPlans.length === 0
+                            ? 'Loading test plans, or no plans are available.'
+                            : 'Loading selected plan analytics...')}
+                </p>
+            </main>
+        );
+    }
+
+    const executed = displayStatus.executed;
+    const executionRate = displayStatus.executionRate;
+    const passRate = displayStatus.passRate;
