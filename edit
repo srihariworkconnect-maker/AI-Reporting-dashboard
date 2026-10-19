@@ -1,176 +1,152 @@
-import * as SDK from 'azure-devops-extension-sdk';
-import type {
-    AdoTestSuite,
-    AdoTestSuiteResponse,
-} from '../types/ado';
+import type { AdoTestSuite } from '../types/ado';
+import type { AdoTestPoint } from './adoApi';
+import { getTestPoints } from './adoApi';
 
-const ORGANIZATION = 'axaiuk-axaazureforge';
-const PROJECT = 'Sandpiper';
-
-export interface AdoTestPlan {
-    id: number;
-    name: string;
+export interface QaMetrics {
+    total: number;
+    passed: number;
+    failed: number;
+    blocked: number;
+    pending: number;
+    notApplicable: number;
+    inProgress: number;
+    otherCompleted: number;
+    unknown: number;
+    executed: number;
+    executionRate: number;
+    passRate: number;
 }
 
-export interface AdoTestPoint {
-    id: number;
+export function getAllSuiteIds(
+    suites: AdoTestSuite[]
+): number[] {
+    const ids = new Set<number>();
 
-    testCaseReference?: {
-        id: number;
-        name: string;
-    };
+    function visit(suite: AdoTestSuite) {
+        if (ids.has(suite.id)) return;
 
-    configuration?: {
-        id: number;
-        name: string;
-    };
+        ids.add(suite.id);
 
-    results?: {
-        outcome?: string;
-        state?: string;
-        lastResultId?: number;
-        lastTestRunId?: number;
-        lastResultDetails?: {
-            dateCompleted?: string;
-            duration?: number;
-            runBy?: {
-                displayName?: string;
-            };
-        };
-    };
+        for (const child of suite.children ?? []) {
+            visit(child);
+        }
+    }
+
+    suites.forEach(visit);
+    return [...ids];
 }
 
-interface AdoListResponse<T> {
-    value: T[];
-    count?: number;
-}
-
-async function getAllPages<T>(
-    path: string,
+export async function loadPlanMetrics(
+    planId: number,
+    suites: AdoTestSuite[],
     signal?: AbortSignal
-): Promise<T[]> {
-    await SDK.ready();
+): Promise<QaMetrics> {
+    const suiteIds = getAllSuiteIds(suites);
+    const allPoints: AdoTestPoint[] = [];
+    const batchSize = 5;
 
-    const accessToken = await SDK.getAccessToken();
-    const items: T[] = [];
-    const seenTokens = new Set<string>();
-    let continuationToken: string | null = null;
+    for (let index = 0; index < suiteIds.length; index += batchSize) {
+        signal?.throwIfAborted();
 
-    do {
-        const url = new URL(
-            `https://dev.azure.com/${ORGANIZATION}/` +
-            `${encodeURIComponent(PROJECT)}/_apis/testplan/${path}`
+        const batch = suiteIds.slice(index, index + batchSize);
+
+        const results = await Promise.all(
+            batch.map(suiteId =>
+                getTestPoints(planId, suiteId, signal)
+            )
         );
 
-        url.searchParams.set('api-version', '7.1');
-
-        if (continuationToken) {
-            url.searchParams.set(
-                'continuationToken',
-                continuationToken
-            );
-        }
-
-        const response = await fetch(url, {
-            signal,
-            headers: {
-                Authorization: `Bearer ${accessToken}`,
-                Accept: 'application/json',
-            },
-        });
-
-        if (!response.ok) {
-            throw new Error(
-                `Azure DevOps request failed: ${response.status}`
-            );
-        }
-
-        const data = await response.json() as AdoListResponse<T>;
-
-        if (!Array.isArray(data.value)) {
-            throw new Error('Unexpected Azure DevOps response.');
-        }
-
-        items.push(...data.value);
-
-        continuationToken =
-            response.headers.get('x-ms-continuationtoken');
-
-        if (continuationToken) {
-            if (seenTokens.has(continuationToken)) {
-                throw new Error(
-                    'Azure DevOps returned a repeated pagination token.'
-                );
-            }
-
-            seenTokens.add(continuationToken);
-        }
-    } while (continuationToken);
-
-    return items;
-}
-
-export async function getTestPlans(
-    signal?: AbortSignal
-): Promise<AdoTestPlan[]> {
-    const plans = await getAllPages<AdoTestPlan>('plans', signal);
-
-    return [...new Map(
-        plans.map(plan => [plan.id, plan])
-    ).values()];
-}
-
-export async function getTestSuites(
-    planId: number,
-    signal?: AbortSignal
-): Promise<AdoTestSuiteResponse> {
-    // Request flat suites; build the tree after all pages arrive.
-    const suites = await getAllPages<AdoTestSuite>(
-        `Plans/${planId}/suites`,
-        signal
-    );
-
-    const nodes = new Map<number, AdoTestSuite>();
-
-    for (const suite of suites) {
-        nodes.set(suite.id, {
-            ...suite,
-            children: [],
-        });
-    }
-
-    const roots: AdoTestSuite[] = [];
-
-    for (const node of nodes.values()) {
-        const parentId = node.parentSuite?.id;
-        const parent = parentId == null
-            ? undefined
-            : nodes.get(parentId);
-
-        if (parent && parent.id !== node.id) {
-            parent.children!.push(node);
-        } else {
-            roots.push(node);
+        for (const points of results) {
+            allPoints.push(...points);
         }
     }
 
-    return {
-        value: roots,
-        count: nodes.size,
-    };
+    return calculateQaMetrics(allPoints);
 }
 
-export async function getTestPoints(
-    planId: number,
-    suiteId: number,
-    signal?: AbortSignal
-): Promise<AdoTestPoint[]> {
-    const points = await getAllPages<AdoTestPoint>(
-        `Plans/${planId}/Suites/${suiteId}/TestPoint`,
-        signal
-    );
-
-    return [...new Map(
+export function calculateQaMetrics(
+    points: AdoTestPoint[]
+): QaMetrics {
+    const uniquePoints = new Map(
         points.map(point => [point.id, point])
-    ).values()];
+    );
+
+    const metrics: QaMetrics = {
+        total: uniquePoints.size,
+        passed: 0,
+        failed: 0,
+        blocked: 0,
+        pending: 0,
+        notApplicable: 0,
+        inProgress: 0,
+        otherCompleted: 0,
+        unknown: 0,
+        executed: 0,
+        executionRate: 0,
+        passRate: 0,
+    };
+
+    for (const point of uniquePoints.values()) {
+        const outcome = point.results?.outcome?.toLowerCase();
+
+        switch (outcome) {
+            case 'passed':
+                metrics.passed++;
+                break;
+
+            case 'failed':
+                metrics.failed++;
+                break;
+
+            case 'blocked':
+                metrics.blocked++;
+                break;
+
+            case 'notapplicable':
+                metrics.notApplicable++;
+                break;
+
+            case 'inprogress':
+            case 'paused':
+                metrics.inProgress++;
+                break;
+
+            case 'none':
+            case 'notexecuted':
+                metrics.pending++;
+                break;
+
+            case 'inconclusive':
+            case 'timeout':
+            case 'aborted':
+            case 'error':
+                metrics.otherCompleted++;
+                break;
+
+            default:
+                metrics.unknown++;
+                break;
+        }
+    }
+
+    // Policy: blocked and N/A do not count as executed.
+    // Other completed outcomes represent completed attempts.
+    metrics.executed =
+        metrics.passed +
+        metrics.failed +
+        metrics.otherCompleted;
+
+    // Policy: N/A points are excluded from the progress denominator.
+    const applicablePoints =
+        metrics.total - metrics.notApplicable;
+
+    metrics.executionRate = applicablePoints > 0
+        ? (metrics.executed / applicablePoints) * 100
+        : 0;
+
+    metrics.passRate = metrics.executed > 0
+        ? (metrics.passed / metrics.executed) * 100
+        : 0;
+
+    return metrics;
 }
