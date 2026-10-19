@@ -1,28 +1,123 @@
-import { StrictMode } from 'react';
-import { createRoot } from 'react-dom/client';
-import './index.css';
-import App from './App';
-import { initializeAdoExtension } from './adoExtension';
+async function getAllPages<T>(
+    path: string,
+    signal?: AbortSignal
+): Promise<T[]> {
+    if (window.self === window.top) {
+        throw new Error('Live ADO data requires the installed ADO extension.');
+    }
 
-async function start() {
-    const root = createRoot(document.getElementById('root')!);
+    await SDK.ready();
 
-    if (window.self !== window.top) {
-        const initialized = await initializeAdoExtension();
+    const items: T[] = [];
+    const seenTokens = new Set<string>();
+    let continuationToken: string | null = null;
 
-        if (!initialized) {
-            root.render(
-                <p>Unable to initialize the Azure DevOps dashboard widget.</p>
-            );
-            return;
+    do {
+        signal?.throwIfAborted();
+
+        const url = new URL(
+            `https://dev.azure.com/${encodeURIComponent(ORGANIZATION)}/` +
+            `${encodeURIComponent(PROJECT)}/_apis/testplan/${path}`
+        );
+
+        url.searchParams.set('api-version', '7.1');
+
+        if (continuationToken) {
+            url.searchParams.set('continuationToken', continuationToken);
+        }
+
+        const accessToken = await SDK.getAccessToken();
+
+        const response = await fetch(url, {
+            signal,
+            headers: {
+                Authorization: `Bearer ${accessToken}`,
+                Accept: 'application/json',
+            },
+        });
+
+        if (!response.ok) {
+            throw new Error(`ADO request failed (${response.status}).`);
+        }
+
+        const data: unknown = await response.json();
+
+        if (
+            typeof data !== 'object' ||
+            data === null ||
+            !('value' in data) ||
+            !Array.isArray(data.value)
+        ) {
+            throw new Error('ADO returned an unexpected response.');
+        }
+
+        items.push(...(data.value as T[]));
+
+        continuationToken =
+            response.headers.get('x-ms-continuationtoken')?.trim() || null;
+
+        if (continuationToken) {
+            if (seenTokens.has(continuationToken)) {
+                throw new Error('ADO returned a repeated continuation token.');
+            }
+
+            seenTokens.add(continuationToken);
+        }
+    } while (continuationToken);
+
+    return items;
+}
+
+export async function getTestPlans(
+    signal?: AbortSignal
+): Promise<AdoTestPlan[]> {
+    const plans = await getAllPages<AdoTestPlan>('plans', signal);
+
+    return [...new Map(plans.map(plan => [plan.id, plan])).values()];
+}
+
+export async function getTestSuites(
+    planId: number,
+    signal?: AbortSignal
+): Promise<AdoTestSuiteResponse> {
+    // Request a flat list, then assemble the hierarchy locally.
+    const suites = await getAllPages<
+        AdoTestSuite & { parentSuite?: { id: number } }
+    >(`Plans/${planId}/suites`, signal);
+
+    const nodes = new Map<number, AdoTestSuite>();
+    const parents = new Map<number, number | undefined>();
+
+    for (const suite of suites) {
+        nodes.set(suite.id, { ...suite, children: [] });
+        parents.set(suite.id, suite.parentSuite?.id);
+    }
+
+    const roots: AdoTestSuite[] = [];
+
+    for (const [id, node] of nodes) {
+        const parentId = parents.get(id);
+        const parent = parentId === undefined ? undefined : nodes.get(parentId);
+
+        if (parent && parentId !== id) {
+            parent.children!.push(node);
+        } else {
+            roots.push(node);
         }
     }
 
-    root.render(
-        <StrictMode>
-            <App />
-        </StrictMode>
-    );
+    return { value: roots, count: nodes.size };
 }
 
-void start();
+export async function getTestPoints(
+    planId: number,
+    suiteId: number,
+    signal?: AbortSignal
+): Promise<AdoTestPoint[]> {
+    const points = await getAllPages<AdoTestPoint>(
+        `Plans/${planId}/Suites/${suiteId}/TestPoint`,
+        signal
+    );
+
+    return [...new Map(points.map(point => [point.id, point])).values()];
+}
