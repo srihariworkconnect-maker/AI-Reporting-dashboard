@@ -1,32 +1,75 @@
+import * as SDK from 'azure-devops-extension-sdk';
+import type {
+    AdoTestSuite,
+    AdoTestSuiteResponse,
+} from '../types/ado';
+
+const ORGANIZATION = 'axaiuk-axaazureforge';
+const PROJECT = 'Sandpiper';
+
+export interface AdoTestPlan {
+    id: number;
+    name: string;
+}
+
+export interface AdoTestPoint {
+    id: number;
+
+    testCaseReference?: {
+        id: number;
+        name: string;
+    };
+
+    configuration?: {
+        id: number;
+        name: string;
+    };
+
+    results?: {
+        outcome?: string;
+        state?: string;
+        lastResultId?: number;
+        lastTestRunId?: number;
+        lastResultDetails?: {
+            dateCompleted?: string;
+            duration?: number;
+            runBy?: {
+                displayName?: string;
+            };
+        };
+    };
+}
+
+interface AdoListResponse<T> {
+    value: T[];
+    count?: number;
+}
+
 async function getAllPages<T>(
     path: string,
     signal?: AbortSignal
 ): Promise<T[]> {
-    if (window.self === window.top) {
-        throw new Error('Live ADO data requires the installed ADO extension.');
-    }
-
     await SDK.ready();
 
+    const accessToken = await SDK.getAccessToken();
     const items: T[] = [];
     const seenTokens = new Set<string>();
     let continuationToken: string | null = null;
 
     do {
-        signal?.throwIfAborted();
-
         const url = new URL(
-            `https://dev.azure.com/${encodeURIComponent(ORGANIZATION)}/` +
+            `https://dev.azure.com/${ORGANIZATION}/` +
             `${encodeURIComponent(PROJECT)}/_apis/testplan/${path}`
         );
 
         url.searchParams.set('api-version', '7.1');
 
         if (continuationToken) {
-            url.searchParams.set('continuationToken', continuationToken);
+            url.searchParams.set(
+                'continuationToken',
+                continuationToken
+            );
         }
-
-        const accessToken = await SDK.getAccessToken();
 
         const response = await fetch(url, {
             signal,
@@ -37,28 +80,27 @@ async function getAllPages<T>(
         });
 
         if (!response.ok) {
-            throw new Error(`ADO request failed (${response.status}).`);
+            throw new Error(
+                `Azure DevOps request failed: ${response.status}`
+            );
         }
 
-        const data: unknown = await response.json();
+        const data = await response.json() as AdoListResponse<T>;
 
-        if (
-            typeof data !== 'object' ||
-            data === null ||
-            !('value' in data) ||
-            !Array.isArray(data.value)
-        ) {
-            throw new Error('ADO returned an unexpected response.');
+        if (!Array.isArray(data.value)) {
+            throw new Error('Unexpected Azure DevOps response.');
         }
 
-        items.push(...(data.value as T[]));
+        items.push(...data.value);
 
         continuationToken =
-            response.headers.get('x-ms-continuationtoken')?.trim() || null;
+            response.headers.get('x-ms-continuationtoken');
 
         if (continuationToken) {
             if (seenTokens.has(continuationToken)) {
-                throw new Error('ADO returned a repeated continuation token.');
+                throw new Error(
+                    'Azure DevOps returned a repeated pagination token.'
+                );
             }
 
             seenTokens.add(continuationToken);
@@ -73,40 +115,49 @@ export async function getTestPlans(
 ): Promise<AdoTestPlan[]> {
     const plans = await getAllPages<AdoTestPlan>('plans', signal);
 
-    return [...new Map(plans.map(plan => [plan.id, plan])).values()];
+    return [...new Map(
+        plans.map(plan => [plan.id, plan])
+    ).values()];
 }
 
 export async function getTestSuites(
     planId: number,
     signal?: AbortSignal
 ): Promise<AdoTestSuiteResponse> {
-    // Request a flat list, then assemble the hierarchy locally.
-    const suites = await getAllPages<
-        AdoTestSuite & { parentSuite?: { id: number } }
-    >(`Plans/${planId}/suites`, signal);
+    // Request flat suites; build the tree after all pages arrive.
+    const suites = await getAllPages<AdoTestSuite>(
+        `Plans/${planId}/suites`,
+        signal
+    );
 
     const nodes = new Map<number, AdoTestSuite>();
-    const parents = new Map<number, number | undefined>();
 
     for (const suite of suites) {
-        nodes.set(suite.id, { ...suite, children: [] });
-        parents.set(suite.id, suite.parentSuite?.id);
+        nodes.set(suite.id, {
+            ...suite,
+            children: [],
+        });
     }
 
     const roots: AdoTestSuite[] = [];
 
-    for (const [id, node] of nodes) {
-        const parentId = parents.get(id);
-        const parent = parentId === undefined ? undefined : nodes.get(parentId);
+    for (const node of nodes.values()) {
+        const parentId = node.parentSuite?.id;
+        const parent = parentId == null
+            ? undefined
+            : nodes.get(parentId);
 
-        if (parent && parentId !== id) {
+        if (parent && parent.id !== node.id) {
             parent.children!.push(node);
         } else {
             roots.push(node);
         }
     }
 
-    return { value: roots, count: nodes.size };
+    return {
+        value: roots,
+        count: nodes.size,
+    };
 }
 
 export async function getTestPoints(
@@ -119,5 +170,7 @@ export async function getTestPoints(
         signal
     );
 
-    return [...new Map(points.map(point => [point.id, point])).values()];
+    return [...new Map(
+        points.map(point => [point.id, point])
+    ).values()];
 }
